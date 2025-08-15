@@ -324,102 +324,62 @@ def get_sheet(filename, sheetname):
 def generate_suggestions():
     try:
         data = request.json
-        goals = data.get("goals_tab", [])
-        domains = data.get("domains_csv", [])
-        strands = data.get("strands_csv", [])
-        cmf_goals = data.get("cmf_goals_csv", [])
-        ref_list = data.get("reflist_csv", [])
-        check_list = data.get("checklist_csv", [])
+        goals = data.get("goals", [])
 
-        # --- Step 1: ONLY partially attained goals with continuation comments ---
-        to_be_selected_again = [
-            g for g in goals
-            if g.get("Attainment status", "").strip().lower() == "partially attained"
-            and any(keyword in g.get("Comments", "").lower()
-                    for keyword in ["continue", "carry forward", "repeat", "redo", "again"])
+        # Only keep partially attained goals
+        partially_attained = [
+            {
+                "goalName": g.get("goal", "").strip(),
+                "comments": g.get("comments", "").strip()
+            }
+            for g in goals
+            if g.get("attainment_status", "").strip().lower() == "partially attained"
         ]
 
-        # If no relevant goals, return empty result
-        if not to_be_selected_again:
-            return jsonify({"parsed": '{"toBeSelectedAgain": [], "suggestedGoals": []}', "raw_output": "{}"})
+        if not partially_attained:
+            return jsonify({"toBeSelectedAgain": []})
 
-        # --- Step 2: Related strands & domains from those partially attained goals ---
-        related_strand_ids = set(g.get("Strand_id") for g in to_be_selected_again if g.get("Strand_id"))
-        related_domain_ids = set(g.get("Domain_id") for g in to_be_selected_again if g.get("Domain_id"))
+        # Build AI prompt
+        prompt = f"""
+You are an AI that analyzes educational goals and determines which ones
+should be selected again for the next cycle.
 
-        filtered_domains = [d for d in domains if d.get("Domain_id") in related_domain_ids]
-        filtered_strands = [s for s in strands if s.get("Strand_id") in related_strand_ids]
-        filtered_cmf_goals = [
-            cg for cg in cmf_goals
-            if (cg.get("Strand_id") in related_strand_ids) or (cg.get("Domain_id") in related_domain_ids)
-        ]
+- Input: A list of goals with their comments.
+- Output: ONLY valid JSON in this format:
 
-        # --- Step 3: Filter ref & checklist ---
-        filtered_ref_list = [
-            r for r in ref_list
-            if r.get("Goal ID") in [g.get("Goal_id") for g in filtered_cmf_goals]
-        ]
-        filtered_check_list = [
-            c for c in check_list
-            if c.get("Goal id") in [g.get("Goal_id") for g in filtered_cmf_goals]
-        ]
-
-        # --- Step 4: Build prompt ---
-        prompt = """
-You are an AI that analyzes goal progress and suggests next steps.
-
-Rules:
-- ALWAYS return ONLY valid JSON (no code fences, no explanations, no extra text).
-- Format must exactly match:
-{
+{{
   "toBeSelectedAgain": [
-    { "goalId": "string", "goalName": "string", "reason": "string" }
-  ],
-  "suggestedGoals": [
-    { "goalId": "string", "goalName": "string", "reason": "string", "refList": ["string"], "checkList": ["string"] }
+    {{ "goalName": "string", "reason": "string" }}
   ]
-}
-- "toBeSelectedAgain" contains ONLY partially attained goals (Attainment status) where comments indicate continuation.
-- "suggestedGoals" should be realistic goals from the same strands/domains.
+}}
+
+- "reason" must clearly mention relevant parts of the provided comments.
+- Include ALL goals that should be repeated, based on comments or context.
+Here is the input:
+{partially_attained}
 """
 
-        ai_payload = {
-            "goals_tab": to_be_selected_again,
-            "domains_csv": filtered_domains,
-            "strands_csv": filtered_strands,
-            "cmf_goals_csv": filtered_cmf_goals,
-            "reflist_csv": filtered_ref_list,
-            "checklist_csv": filtered_check_list
-        }
-
-        messages = [
-            {"role": "system", "content": "You are a JSON-only generator. Never add explanations, markdown, or code fences."},
-            {"role": "user", "content": prompt},
-            {"role": "user", "content": str(ai_payload)}
-        ]
-
-        # --- Step 5: Call GPT ---
+        # Send to OpenAI
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             temperature=0.2,
-            max_tokens=1000,
-            messages=messages
+            max_tokens=800,
+            messages=[
+                {"role": "system", "content": "You output only JSON. No markdown, no extra text."},
+                {"role": "user", "content": prompt}
+            ]
         )
 
         raw_output = response.choices[0].message.content.strip()
 
-        # --- Step 6: Extract JSON ---
+        # Extract JSON
         json_start = raw_output.find("{")
         json_end = raw_output.rfind("}")
         if json_start == -1 or json_end == -1:
-            return jsonify({"error": "AI did not return JSON", "raw_output": raw_output}), 400
+            return jsonify({"error": "Invalid AI output", "raw_output": raw_output}), 400
 
-        parsed_json = raw_output[json_start:json_end + 1]
-
-        return jsonify({
-            "parsed": parsed_json,
-            "raw_output": raw_output
-        })
+        parsed = raw_output[json_start:json_end+1]
+        return jsonify(eval(parsed))  # safe here since AI returns JSON format
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
