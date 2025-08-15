@@ -6,6 +6,7 @@ import pandas as pd
 import re
 from openai import OpenAI
 from dotenv import load_dotenv
+from flask_sqlalchemy import SQLAlchemy
 
 # Load environment variables from .env
 load_dotenv()
@@ -13,8 +14,16 @@ load_dotenv()
 # Initialize OpenAI client with API key from .env
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
+# Initialize Flask app
 app = Flask(__name__)
 CORS(app)
+
+# Configure Database
+app.config["SQLALCHEMY_DATABASE_URI"] = os.getenv("DATABASE_URL")
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+
+# Initialize DB object
+db = SQLAlchemy(app)
 
 # Config
 UPLOAD_FOLDER = "uploads"
@@ -322,13 +331,21 @@ def generate_suggestions():
         ref_list = data.get("reflist_csv", [])
         check_list = data.get("checklist_csv", [])
 
-        # --- Step 1: Identify relevant goals ---
-        partial_goals = [g for g in goals if "partial" in g.get("Comments", "").lower()]
-        achieved_goals = [g for g in goals if "achieved" in g.get("Status", "").lower()]
+        # --- Step 1: ONLY partially attained goals with continuation comments ---
+        to_be_selected_again = [
+            g for g in goals
+            if g.get("Attainment status", "").strip().lower() == "partially attained"
+            and any(keyword in g.get("Comments", "").lower()
+                    for keyword in ["continue", "carry forward", "repeat", "redo", "again"])
+        ]
 
-        # --- Step 2: Related strands & domains ---
-        related_strand_ids = set(g.get("Strand_id") for g in achieved_goals if g.get("Strand_id"))
-        related_domain_ids = set(g.get("Domain_id") for g in achieved_goals if g.get("Domain_id"))
+        # If no relevant goals, return empty result
+        if not to_be_selected_again:
+            return jsonify({"parsed": '{"toBeSelectedAgain": [], "suggestedGoals": []}', "raw_output": "{}"})
+
+        # --- Step 2: Related strands & domains from those partially attained goals ---
+        related_strand_ids = set(g.get("Strand_id") for g in to_be_selected_again if g.get("Strand_id"))
+        related_domain_ids = set(g.get("Domain_id") for g in to_be_selected_again if g.get("Domain_id"))
 
         filtered_domains = [d for d in domains if d.get("Domain_id") in related_domain_ids]
         filtered_strands = [s for s in strands if s.get("Strand_id") in related_strand_ids]
@@ -362,15 +379,12 @@ Rules:
     { "goalId": "string", "goalName": "string", "reason": "string", "refList": ["string"], "checkList": ["string"] }
   ]
 }
-- "toBeSelectedAgain" contains partially attained goals (from Comments).
-- "suggestedGoals" contains up to 7 realistic new goals from the same strands/domains as attained goals.
-- Include up to 4 refList items and 4 checkList items for each suggested goal.
-- If a suggested goal has no refList or checkList, give a meaningful rationale in "reason".
+- "toBeSelectedAgain" contains ONLY partially attained goals (Attainment status) where comments indicate continuation.
+- "suggestedGoals" should be realistic goals from the same strands/domains.
 """
 
-        # --- Step 5: Prepare data for AI ---
         ai_payload = {
-            "goals_tab": partial_goals + achieved_goals,
+            "goals_tab": to_be_selected_again,
             "domains_csv": filtered_domains,
             "strands_csv": filtered_strands,
             "cmf_goals_csv": filtered_cmf_goals,
@@ -384,7 +398,7 @@ Rules:
             {"role": "user", "content": str(ai_payload)}
         ]
 
-        # --- Step 6: Call GPT ---
+        # --- Step 5: Call GPT ---
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             temperature=0.2,
@@ -394,13 +408,7 @@ Rules:
 
         raw_output = response.choices[0].message.content.strip()
 
-        # --- Step 7: Debug logs ---
-        print("=== DEBUG PROMPT ===")
-        print(messages)
-        print("=== RAW AI OUTPUT ===")
-        print(raw_output)
-
-        # --- Step 8: Extract JSON ---
+        # --- Step 6: Extract JSON ---
         json_start = raw_output.find("{")
         json_end = raw_output.rfind("}")
         if json_start == -1 or json_end == -1:

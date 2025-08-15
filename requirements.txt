@@ -6,3 +6,5 @@ openai
 python-dotenv
 openpyxl
 gunicorn
+psycopg2-binary
+SQLAlchemy
